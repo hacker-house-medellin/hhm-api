@@ -1,0 +1,20 @@
+[package]
+org = "hacker-house-medellin"
+name = "hhm-api"
+version = "0.1.0"
+description = "Rust API server for Hacker House Medellín"
+license = "MIT"
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/hacker-house-medellin/hhm-api"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log"]
+
+[dependencies]
+"hacker-house-medellin/hhm-interfaces" = "^0.1.0"
+"hacker-house-medellin/hhm-libs" = "^0.1.0"
