@@ -166,7 +166,8 @@ fn parse_cors_origins(raw: &str) -> anyhow::Result<Vec<HeaderValue>> {
         {
             bail!("CORS origin must be an exact http(s) origin without a path: {origin}");
         }
-        let header = HeaderValue::from_str(origin)
+        let header = origin
+            .parse::<HeaderValue>()
             .with_context(|| format!("invalid CORS origin header: {origin}"))?;
         if !origins.contains(&header) {
             origins.push(header);
