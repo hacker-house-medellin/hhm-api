@@ -193,7 +193,7 @@ async fn list_records(State(state): State<AppState>) -> Json<Vec<Reservation>> {
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    records.sort_by_key(|record| record.created_at);
     Json(records)
 }
 
