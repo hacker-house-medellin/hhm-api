@@ -4,38 +4,63 @@
 
 Operations and community software for an entrepreneur-focused coliving and coworking house in Medellín, Colombia.
 
-This repository was bootstrapped on 2026-08-04. It is designed as an independently deployable component and as a member of the `hhm-monorepo` workspace.
-
-## GitHub target
-
-`hacker-house-medellin/hhm-api`
+This repository is an independently deployable component and a member of the `hhm-monorepo` workspace.
 
 ## Baseline
 
-- Rust 2024 edition for backend and native components.
-- Axum HTTP/WebSocket transport.
-- Supabase/PostgreSQL configuration through `DATABASE_URL`, `SUPABASE_URL`, and environment-only secrets.
+- Rust 2024 edition.
+- Axum HTTP and WebSocket transport.
+- SeaORM/PostgreSQL connection through `DATABASE_URL`.
+- Supabase configuration through `SUPABASE_URL` and environment-only secrets.
 - OpenTelemetry-compatible tracing hooks.
-- Docker, Nix, and GitHub Actions entry points.
-- Contracts live in `hhm-interfaces`; shared behavior lives in `hhm-libs`.
+- Docker and GitHub Actions entry points.
+- Contracts live in `hhm-interfaces`; shared behavior belongs in `hhm-libs`.
 
-### Routes
+## Implemented routes
 
-- `/v1/reservations`
-- `/v1/members`
-- `/v1/rooms`
-- `/v1/community/events`
-- `/v1/ws`
+- `GET /healthz`
+- `GET /v1/reservations`
+- `POST /v1/reservations`
+- `GET /v1/reservations/{id}`
+- `GET /v1/ws`
+
+The current reservation store is process-local. A configured database connection is reported by `/healthz`, but persistence and migrations remain a separate delivery gate.
+
+## Reservation boundary
+
+Creation accepts a JSON object with:
+
+- `member_name`
+- `room_type`
+- `check_in`
+- `check_out`
+- `workspace_plan`
+- `status`
+- `notes`
+
+Text fields are trimmed and bounded. `check_out` must be later than `check_in`, a stay may not exceed 366 days, and status must be one of `pending`, `confirmed`, `checked_in`, `checked_out`, or `cancelled`. Invalid input receives a typed `422` response.
+
+Successful creation broadcasts a typed `reservation.created` envelope. Lagged WebSocket consumers skip dropped broadcast items and continue receiving subsequent events.
+
+## CORS
+
+`CORS_ORIGINS` is a comma-separated list of exact `http` or `https` origins. Wildcards, paths, and query strings are rejected at startup. Leaving it empty allows same-origin use while emitting no cross-origin allow header.
+
+Example:
+
+```dotenv
+CORS_ORIGINS=http://localhost:3000,https://app.example.test
+```
 
 ## Development
 
 ```bash
-cp .env.example .env 2>/dev/null || true
-nix develop  # optional
-cargo fmt --check 2>/dev/null || true
-cargo test 2>/dev/null || true
+cp .env.example .env
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```
 
-## Status
+## Deployment boundary
 
-Foundation scaffold. Domain behavior, persistence migrations, authentication policy, and production secrets must be reviewed before deployment.
+Authentication, durable reservation persistence, migrations, tenant isolation, rate limiting, and production secrets must be completed and reviewed before deployment. Do not treat the in-memory scaffold as a production booking system.
