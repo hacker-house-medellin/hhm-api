@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 mod auth;
 mod observability;
+pub mod presence;
 mod visitor;
 
 use auth::{Authorization, DualAuth};
