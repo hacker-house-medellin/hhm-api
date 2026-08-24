@@ -20,7 +20,7 @@ const QR_KEY_ENV: &str = "VISITOR_QR_SIGNING_KEY";
 const DOOR_IDS_ENV: &str = "VISITOR_DOOR_IDS";
 const NOTICE_VERSION_ENV: &str = "VISITOR_PRIVACY_NOTICE_VERSION";
 const QR_SCHEMA: &str = "hhm.visitor-qr.v1";
-const QR_AUDIENCE: &str = "hhm-api";
+const QR_AUDIENCE: &str = "hhm-visitor-access";
 const TOKEN_PREFIX: &str = "hhm1";
 const QR_GRACE_SECONDS: i64 = 15;
 const MAX_TOKEN_BYTES: usize = 1_024;
@@ -553,6 +553,22 @@ mod tests {
             ),
             Err(VisitorError::ExpiredQr)
         );
+    }
+
+    #[test]
+    fn qr_claim_uses_the_purpose_specific_visitor_audience() {
+        let issued = service()
+            .issue(
+                "front-door",
+                VisitorAction::CheckIn,
+                timestamp("2026-08-24T12:00:10Z"),
+            )
+            .unwrap();
+        let token = issued.qr_payload.trim_start_matches("hhm-visitor:");
+        let encoded_claims = token.split('.').nth(1).unwrap();
+        let claims: QrClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded_claims).unwrap()).unwrap();
+        assert_eq!(claims.audience, "hhm-visitor-access");
     }
 
     #[test]
