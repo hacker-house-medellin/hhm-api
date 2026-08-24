@@ -11,8 +11,8 @@ This repository is an independently deployable component and a member of the `hh
 - Rust 2024 edition.
 - Axum HTTP and WebSocket transport.
 - SeaORM/PostgreSQL connection through `DATABASE_URL`.
-- Supabase configuration through `SUPABASE_URL` and environment-only secrets.
-- OpenTelemetry-compatible tracing hooks.
+- Dual Shared Auth and Supabase authentication through the official `shared-auth-lib` guard, pinned to an immutable revision.
+- Structured operational events through `oresoftware-next-loggers`, pinned to an immutable `ores-otel` revision.
 - Docker and GitHub Actions entry points.
 - Contracts live in `hhm-interfaces`; shared behavior belongs in `hhm-libs`.
 
@@ -22,9 +22,13 @@ This repository is an independently deployable component and a member of the `hh
 - `GET /v1/reservations`
 - `POST /v1/reservations`
 - `GET /v1/reservations/{id}`
+- `POST /v1/visitor-qr/{check-in|check-out}`
+- `POST /v1/visits/check-in`
+- `POST /v1/visits/check-out`
 - `GET /v1/ws`
 
-The current reservation store is process-local. A configured database connection is reported by `/healthz`, but persistence and migrations remain a separate delivery gate.
+The current reservation store is process-local. Its routes and WebSocket are disabled by default; `ALLOW_UNAUTHENTICATED_DEMO_RESERVATIONS=true` enables them only for explicit local scaffolding. The in-memory store is capped at 10,000 records. A configured database connection is reported by `/healthz`, but persistence and migrations remain a separate delivery gate.
+All request bodies are limited to 64 KiB.
 
 ## Reservation boundary
 
@@ -41,6 +45,28 @@ Creation accepts a JSON object with:
 Text fields are trimmed and bounded. `check_out` must be later than `check_in`, a stay may not exceed 366 days, and status must be one of `pending`, `confirmed`, `checked_in`, `checked_out`, or `cancelled`. Invalid input receives a typed `422` response.
 
 Successful creation broadcasts a typed `reservation.created` envelope. Lagged WebSocket consumers skip dropped broadcast items and continue receiving subsequent events.
+
+## Visitor access boundary
+
+`POST /v1/visitor-qr/{action}` issues a QR payload for an allowlisted door. It requires authentication through either Shared Auth or Supabase and then applies HHM-owned product authorization using an exact verified `(provider, tenant, subject)` tuple from `HHM_QR_ISSUER_IDENTITIES`. Email addresses and Shared Auth roles are deliberately not authorization inputs. If both authentication authorities are unavailable, issuance fails with `503` instead of silently allowing access.
+
+The QR token is:
+
+- signed with HMAC-SHA-256 using `VISITOR_QR_SIGNING_KEY`;
+- bound to the `hhm-visitor-access` audience, door, and `check-in` or `check-out` action;
+- rotated on every UTC minute boundary, with a 15-second scan grace period;
+- bounded and compared in constant time;
+- rate-limited to 128 successful redemptions per door/action/minute token.
+
+Check-in requires the exact current `VISITOR_PRIVACY_NOTICE_VERSION`, records only a bounded display name, and returns a private checkout receipt. Check-out requires a current exit QR, the visit ID, and that private receipt. The receipt is stored only as an HMAC tag, and the display name is erased on checkout. Operational logs contain event type, outcome, and bounded door ID only—never names, tokens, receipts, or authentication credentials.
+
+Visitor records and QR redemption counters are currently process-local. Restarting the API loses them, and multiple replicas do not share them. `/healthz` reports `visitor_state_durable: false`; production deployment is blocked until the state and atomic redemption limits are moved to a durable shared store.
+
+## Dual-auth configuration
+
+The visitor QR feature is fail-closed: either all dual-auth variables are supplied or none are. Required variables are `SHARED_AUTH_BASE_URL`, `SHARED_AUTH_ISSUER`, `SHARED_AUTH_AUDIENCE`, `AUTH_INTROSPECT_SECRET`, `SUPABASE_URL`, `SUPABASE_PROJECT_REF`, `SUPABASE_ANON_KEY`, and `HHM_QR_ISSUER_IDENTITIES`. Remote authority URLs must use HTTPS; plaintext HTTP is accepted only for loopback development.
+
+The visitor QR service similarly requires all of `VISITOR_QR_SIGNING_KEY`, `VISITOR_DOOR_IDS`, and `VISITOR_PRIVACY_NOTICE_VERSION`. The signing key must be unpadded base64url decoding to 32–64 bytes. Keep all credentials in the encrypted environment workflow described below.
 
 ## CORS
 
@@ -63,7 +89,9 @@ cargo test --all-targets --all-features
 
 ## Deployment boundary
 
-Authentication, durable reservation persistence, migrations, tenant isolation, rate limiting, and production secrets must be completed and reviewed before deployment. Do not treat the in-memory scaffold as a production booking system.
+Durable reservation and visitor persistence, migrations, tenant isolation and product authorization for reservation routes, distributed rate limiting, key rotation, production secret provisioning, and an end-to-end authorization review must be completed before deployment. The reservation endpoints and WebSocket are unauthenticated scaffolding and therefore fail closed unless the local-only demo flag is explicitly enabled. Do not expose this service to an untrusted network or treat its process-local state as a production booking or physical-access system.
+
+Camera, microphone, facial-recognition, conversation-recording, and activity-inference ingestion are intentionally not implemented in this service. Those features require the privacy, consent, zoning, retention, encryption, access-control, and human-review gates in [`docs/surveillance-privacy-boundary.md`](docs/surveillance-privacy-boundary.md) before implementation.
 
 ## Environment secrets
 

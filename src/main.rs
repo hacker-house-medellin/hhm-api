@@ -4,11 +4,14 @@ use anyhow::{Context, bail};
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        DefaultBodyLimit, Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
-    response::IntoResponse,
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
+    response::{IntoResponse, Response},
     routing::get,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -23,6 +26,16 @@ use tower_http::{
 use tracing::{error, info};
 use uuid::Uuid;
 
+mod auth;
+mod observability;
+mod visitor;
+
+use auth::{Authorization, DualAuth};
+use observability::Observability;
+use visitor::{
+    CheckInRequest, CheckOutRequest, IssueQrRequest, VisitorAction, VisitorError, VisitorService,
+};
+
 const MAX_MEMBER_NAME_CHARS: usize = 200;
 const MAX_ROOM_TYPE_CHARS: usize = 100;
 const MAX_WORKSPACE_PLAN_CHARS: usize = 100;
@@ -35,6 +48,8 @@ const RESERVATION_STATUSES: [&str; 5] = [
     "checked_out",
     "cancelled",
 ];
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_DEMO_RESERVATIONS: usize = 10_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -42,6 +57,10 @@ struct AppState {
     records: Arc<RwLock<HashMap<Uuid, Reservation>>>,
     events: broadcast::Sender<String>,
     supabase_url: Option<String>,
+    auth: Option<DualAuth>,
+    visitors: Option<VisitorService>,
+    demo_reservations_enabled: bool,
+    observability: Observability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +78,7 @@ struct Reservation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateReservation {
     pub member_name: String,
     pub room_type: String,
@@ -87,6 +107,11 @@ struct Health {
     status: &'static str,
     database_configured: bool,
     supabase_configured: bool,
+    dual_auth_configured: bool,
+    visitor_qr_configured: bool,
+    visitor_state_durable: bool,
+    demo_reservations_enabled: bool,
+    active_visits: usize,
 }
 
 #[tokio::main]
@@ -97,26 +122,46 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let db = match env::var("DATABASE_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(
-            Database::connect(url)
-                .await
-                .context("connect database")?,
-        ),
+        Ok(url) if !url.trim().is_empty() => {
+            Some(Database::connect(url).await.context("connect database")?)
+        }
         _ => None,
     };
     let (events, _) = broadcast::channel(512);
+    let auth = DualAuth::from_environment()?;
+    let visitors = VisitorService::from_environment()?;
+    if visitors.is_some() && auth.is_none() {
+        bail!("visitor QR requires complete Shared Auth and Supabase dual-auth configuration");
+    }
     let state = AppState {
         db,
         records: Arc::new(RwLock::new(HashMap::new())),
         events,
         supabase_url: non_empty_env("SUPABASE_URL"),
+        auth,
+        visitors,
+        demo_reservations_enabled: matches!(
+            non_empty_env("ALLOW_UNAUTHENTICATED_DEMO_RESERVATIONS").as_deref(),
+            Some("true")
+        ),
+        observability: Observability::new(),
     };
 
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/reservations", get(list_records).post(create_record))
         .route("/v1/reservations/{id}", get(get_record))
+        .route(
+            "/v1/visitor-qr/{action}",
+            axum::routing::post(issue_visitor_qr),
+        )
+        .route("/v1/visits/check-in", axum::routing::post(visitor_check_in))
+        .route(
+            "/v1/visits/check-out",
+            axum::routing::post(visitor_check_out),
+        )
         .route("/v1/ws", get(ws_upgrade))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(cors_layer()?)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -142,7 +187,11 @@ fn cors_layer() -> anyhow::Result<CorsLayer> {
     let origins = parse_cors_origins(&env::var("CORS_ORIGINS").unwrap_or_default())?;
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([CONTENT_TYPE]);
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static("x-supabase-token"),
+        ]);
     Ok(if origins.is_empty() {
         layer
     } else {
@@ -152,7 +201,11 @@ fn cors_layer() -> anyhow::Result<CorsLayer> {
 
 fn parse_cors_origins(raw: &str) -> anyhow::Result<Vec<HeaderValue>> {
     let mut origins = Vec::new();
-    for origin in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for origin in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         if origin == "*" {
             bail!("CORS_ORIGINS must not contain a wildcard");
         }
@@ -177,15 +230,105 @@ fn parse_cors_origins(raw: &str) -> anyhow::Result<Vec<HeaderValue>> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
+    let active_visits = match &state.visitors {
+        Some(visitors) => visitors.active_visit_count().await,
+        None => 0,
+    };
     Json(Health {
         service: "hhm-api",
         status: "ok",
         database_configured: state.db.is_some(),
         supabase_configured: state.supabase_url.is_some(),
+        dual_auth_configured: state.auth.is_some(),
+        visitor_qr_configured: state.visitors.is_some(),
+        visitor_state_durable: false,
+        demo_reservations_enabled: state.demo_reservations_enabled,
+        active_visits,
     })
 }
 
-async fn list_records(State(state): State<AppState>) -> Json<Vec<Reservation>> {
+async fn issue_visitor_qr(
+    Path(action): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<IssueQrRequest>,
+) -> Result<Json<visitor::IssuedQr>, (StatusCode, Json<ApiError>)> {
+    let action = action.parse::<VisitorAction>().map_err(visitor_error)?;
+    let auth = state.auth.as_ref().ok_or_else(service_not_configured)?;
+    match auth.authorize_qr_issuer(&headers).await {
+        Authorization::Authorized => state.observability.authorization_event("authorized"),
+        Authorization::Anonymous | Authorization::Unauthenticated => {
+            state.observability.authorization_event("unauthenticated");
+            return Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "authentication required",
+            ));
+        }
+        Authorization::Degraded => {
+            state.observability.authorization_event("degraded");
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_unavailable",
+                "authentication is temporarily unavailable",
+            ));
+        }
+        Authorization::Forbidden => {
+            state.observability.authorization_event("forbidden");
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "caller is not authorized to issue visitor QR codes",
+            ));
+        }
+    }
+
+    let visitors = state.visitors.as_ref().ok_or_else(service_not_configured)?;
+    let issued = visitors
+        .issue(&request.door_id, action, Utc::now())
+        .map_err(visitor_error)?;
+    state
+        .observability
+        .visitor_event(action.as_event_name(), "issued", &request.door_id);
+    Ok(Json(issued))
+}
+
+async fn visitor_check_in(
+    State(state): State<AppState>,
+    Json(request): Json<CheckInRequest>,
+) -> Result<(StatusCode, Json<visitor::CheckInReceipt>), (StatusCode, Json<ApiError>)> {
+    let visitors = state.visitors.as_ref().ok_or_else(service_not_configured)?;
+    let door_id = request.door_id.clone();
+    let receipt = visitors
+        .check_in(request, Utc::now())
+        .await
+        .map_err(visitor_error)?;
+    state
+        .observability
+        .visitor_event("visitor.check_in", "accepted", &door_id);
+    Ok((StatusCode::CREATED, Json(receipt)))
+}
+
+async fn visitor_check_out(
+    State(state): State<AppState>,
+    Json(request): Json<CheckOutRequest>,
+) -> Result<Json<visitor::CheckOutReceipt>, (StatusCode, Json<ApiError>)> {
+    let visitors = state.visitors.as_ref().ok_or_else(service_not_configured)?;
+    let door_id = request.door_id.clone();
+    let receipt = visitors
+        .check_out(request, Utc::now())
+        .await
+        .map_err(visitor_error)?;
+    state
+        .observability
+        .visitor_event("visitor.check_out", "accepted", &door_id);
+    Ok(Json(receipt))
+}
+
+async fn list_records(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Reservation>>, (StatusCode, Json<ApiError>)> {
+    require_demo_reservations(&state)?;
     let mut records = state
         .records
         .read()
@@ -194,13 +337,14 @@ async fn list_records(State(state): State<AppState>) -> Json<Vec<Reservation>> {
         .cloned()
         .collect::<Vec<_>>();
     records.sort_by_key(|record| record.created_at);
-    Json(records)
+    Ok(Json(records))
 }
 
 async fn get_record(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<Json<Reservation>, (StatusCode, Json<ApiError>)> {
+    require_demo_reservations(&state)?;
     state
         .records
         .read()
@@ -215,6 +359,7 @@ async fn create_record(
     State(state): State<AppState>,
     Json(input): Json<CreateReservation>,
 ) -> Result<(StatusCode, Json<Reservation>), (StatusCode, Json<ApiError>)> {
+    require_demo_reservations(&state)?;
     let input = normalize_and_validate(input).map_err(|message| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -248,7 +393,16 @@ async fn create_record(
         )
     })?;
 
-    state.records.write().await.insert(record.id, record.clone());
+    let mut records = state.records.write().await;
+    if records.len() >= MAX_DEMO_RESERVATIONS {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reservation_capacity_reached",
+            "reservation demo capacity reached",
+        ));
+    }
+    records.insert(record.id, record.clone());
+    drop(records);
     let _ = state.events.send(event);
     Ok((StatusCode::CREATED, Json(record)))
 }
@@ -268,7 +422,9 @@ fn normalize_and_validate(mut input: CreateReservation) -> Result<CreateReservat
         MAX_WORKSPACE_PLAN_CHARS,
     )?;
     if input.notes.chars().count() > MAX_NOTES_CHARS {
-        return Err(format!("notes must be at most {MAX_NOTES_CHARS} characters"));
+        return Err(format!(
+            "notes must be at most {MAX_NOTES_CHARS} characters"
+        ));
     }
     if input.check_out <= input.check_in {
         return Err("check_out must be later than check_in".to_owned());
@@ -309,8 +465,69 @@ fn api_error(
     )
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+fn service_not_configured() -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "service_not_configured",
+        "visitor access is not configured",
+    )
+}
+
+fn require_demo_reservations(state: &AppState) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .demo_reservations_enabled
+        .then_some(())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "reservation_demo_disabled",
+                "reservation demo is disabled until authenticated durable storage is configured",
+            )
+        })
+}
+
+fn visitor_error(error: VisitorError) -> (StatusCode, Json<ApiError>) {
+    match error {
+        VisitorError::InvalidAction
+        | VisitorError::InvalidDoor
+        | VisitorError::NoticeNotAccepted
+        | VisitorError::InvalidVisitorName => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_visitor_request",
+            "visitor request is invalid",
+        ),
+        VisitorError::InvalidQr
+        | VisitorError::ExpiredQr
+        | VisitorError::VisitNotFound
+        | VisitorError::InvalidReceipt => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_visitor_credential",
+            "visitor credential is invalid or expired",
+        ),
+        VisitorError::CapacityReached => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "visitor_capacity_reached",
+            "visitor access is temporarily unavailable",
+        ),
+        VisitorError::RateLimited => api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "visitor_rate_limited",
+            "too many visitor check-ins for this QR code",
+        ),
+        VisitorError::AlreadyCheckedOut => api_error(
+            StatusCode::CONFLICT,
+            "visitor_already_checked_out",
+            "visitor is already checked out",
+        ),
+    }
+}
+
+async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    if let Err(error) = require_demo_reservations(&state) {
+        return error.into_response();
+    }
     ws.on_upgrade(move |socket| websocket(socket, state))
+        .into_response()
 }
 
 async fn websocket(socket: WebSocket, state: AppState) {
@@ -413,14 +630,53 @@ mod tests {
     }
 
     #[test]
+    fn reservation_input_is_strict_and_demo_routes_fail_closed() {
+        assert!(
+            serde_json::from_value::<CreateReservation>(serde_json::json!({
+                "member_name": "Ada",
+                "room_type": "private",
+                "check_in": "2026-09-01T15:00:00Z",
+                "check_out": "2026-09-14T11:00:00Z",
+                "workspace_plan": "desk",
+                "status": "confirmed",
+                "notes": "",
+                "unexpected": "value"
+            }))
+            .is_err()
+        );
+
+        let (events, _) = broadcast::channel(1);
+        let mut state = AppState {
+            db: None,
+            records: Arc::new(RwLock::new(HashMap::new())),
+            events,
+            supabase_url: None,
+            auth: None,
+            visitors: None,
+            demo_reservations_enabled: false,
+            observability: Observability::new(),
+        };
+        let denied = require_demo_reservations(&state).expect_err("demo must fail closed");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+        state.demo_reservations_enabled = true;
+        assert!(require_demo_reservations(&state).is_ok());
+    }
+
+    #[test]
     fn parses_exact_cors_origins_and_deduplicates_them() {
         let origins = parse_cors_origins(
             "https://app.example.test, https://admin.example.test,https://app.example.test",
         )
         .expect("origins are valid");
         assert_eq!(origins.len(), 2);
-        assert_eq!(origins[0], HeaderValue::from_static("https://app.example.test"));
-        assert_eq!(origins[1], HeaderValue::from_static("https://admin.example.test"));
+        assert_eq!(
+            origins[0],
+            HeaderValue::from_static("https://app.example.test")
+        );
+        assert_eq!(
+            origins[1],
+            HeaderValue::from_static("https://admin.example.test")
+        );
     }
 
     #[test]
