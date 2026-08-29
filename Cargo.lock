@@ -680,6 +680,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "hhm-interfaces",
  "hmac",
  "oresoftware-next-loggers",
  "sea-orm",
@@ -691,6 +692,17 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "hhm-interfaces"
+version = "0.1.0"
+source = "git+https://github.com/hacker-house-medellin/hhm-interfaces?rev=ffc1df71d1d89202b431f4830cc2a43e4a451da3#ffc1df71d1d89202b431f4830cc2a43e4a451da3"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

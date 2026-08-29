@@ -12,6 +12,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 hmac = "0.12"
+hhm-interfaces = { git = "https://github.com/hacker-house-medellin/hhm-interfaces", rev = "ffc1df71d1d89202b431f4830cc2a43e4a451da3" }
 oresoftware-next-loggers = { git = "https://github.com/ores-otel/ores.otel.log", rev = "ca176fb6768a9750d262a536952268625ffd3a8a" }
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres"] }
 serde = { version = "1", features = ["derive"] }
