@@ -7,14 +7,20 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 futures-util = "0.3"
-sea-orm = { version = "2.0", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres"] }
+hmac = "0.12"
+hhm-interfaces = { git = "https://github.com/hacker-house-medellin/hhm-interfaces", rev = "ffc1df71d1d89202b431f4830cc2a43e4a451da3" }
+oresoftware-next-loggers = { git = "https://github.com/ores-otel/ores.otel.log", rev = "ca176fb6768a9750d262a536952268625ffd3a8a" }
+sea-orm = { version = "2.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+shared-auth-lib = { git = "https://github.com/shared-auth/shared-auth-lib", rev = "4972cfd4eee43ddd9130b9c846caff1c5da7ae95" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
