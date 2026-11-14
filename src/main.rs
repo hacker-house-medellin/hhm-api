@@ -465,6 +465,9 @@ fn validate_required_text(label: &str, value: &str, maximum: usize) -> Result<()
     if value.chars().count() > maximum {
         return Err(format!("{label} must be at most {maximum} characters"));
     }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} must not contain control characters"));
+    }
     Ok(())
 }
 
@@ -644,6 +647,37 @@ mod tests {
             normalize_and_validate(stay).expect_err("long stay must fail"),
             format!("stay must not exceed {MAX_STAY_DAYS} days")
         );
+    }
+
+    #[test]
+    fn rejects_control_characters_in_reservation_identity_fields() {
+        for (field, input) in [
+            ("member_name", "Ada\\nOperator"),
+            ("room_type", "private\\u{0000}admin"),
+            ("workspace_plan", "desk\\tadmin"),
+        ] {
+            let mut reservation = valid_input();
+            match field {
+                "member_name" => reservation.member_name = input.to_owned(),
+                "room_type" => reservation.room_type = input.to_owned(),
+                "workspace_plan" => reservation.workspace_plan = input.to_owned(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                normalize_and_validate(reservation).expect_err("control character must fail"),
+                format!("{field} must not contain control characters")
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_unicode_reservation_names_and_multiline_notes() {
+        let mut reservation = valid_input();
+        reservation.member_name = "María José".to_owned();
+        reservation.notes = "Arrival details\\nAllergy information".to_owned();
+        let normalized = normalize_and_validate(reservation).expect("valid input");
+        assert_eq!(normalized.member_name, "María José");
+        assert_eq!(normalized.notes, "Arrival details\\nAllergy information");
     }
 
     #[test]
