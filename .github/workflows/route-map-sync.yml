@@ -12,15 +12,15 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: hacker-house-medellin/hhm-lib-core
-          path: ../hhm-lib-core
+          path: hhm-lib-core
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       # No pip install: the checker and generator are standard library only, so
       # CI and a developer laptop cannot reach different verdicts.
       - name: Validate the route maps and the generated clients
-        run: python3 scripts/check-route-sync.py --root .
+        run: python3 scripts/check-route-sync.py --root . --map hhm-lib-core/route-maps/api.route-map.json
